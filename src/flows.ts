@@ -71,14 +71,17 @@ function formatMessageParts(parts: any[]): string {
       if (p.type === "text" && p.text) return escapeHtml(p.text);
       if (p.type === "tool") {
         const name = p.tool ?? "unknown";
+        const state = p.state ?? {};
         let s = `<b>Tool: ${escapeHtml(name)}</b>\n`;
-        if (p.input) {
-          const input = typeof p.input === "string" ? p.input : JSON.stringify(p.input, null, 2);
-          s += `<b>Input:</b>\n<pre>${escapeHtml(input)}</pre>\n`;
+        const input = state.input ?? p.input;
+        if (input) {
+          const inputStr = typeof input === "string" ? input : JSON.stringify(input, null, 2);
+          s += `<b>Input:</b>\n<pre>${escapeHtml(inputStr)}</pre>\n`;
         }
-        if (p.output) {
-          const output = typeof p.output === "string" ? p.output : JSON.stringify(p.output);
-          s += `<b>Output:</b>\n<pre>${escapeHtml(output.slice(0, 500))}</pre>\n`;
+        const output = state.output ?? state.metadata?.output ?? p.output;
+        if (output) {
+          const outputStr = typeof output === "string" ? output : JSON.stringify(output);
+          s += `<b>Output:</b>\n<pre>${escapeHtml(outputStr.slice(0, 500))}</pre>\n`;
         }
         return s;
       }
@@ -143,10 +146,10 @@ export function extractPermissionPrompt(properties: Record<string, any>): string
     lines.push(`<b>Permission:</b> ${escapeHtml(String(properties.permission))}`);
   }
   if (Array.isArray(properties.patterns) && properties.patterns.length > 0) {
-    lines.push(`<b>Match:</b> ${properties.patterns.map(String).join(", ")}`);
+    lines.push(`<b>Match:</b> ${properties.patterns.map((p: any) => escapeHtml(String(p))).join(", ")}`);
   }
   if (Array.isArray(properties.always) && properties.always.length > 0) {
-    lines.push(`<b>Always allow:</b> ${properties.always.map(String).join(", ")}`);
+    lines.push(`<b>Always allow:</b> ${properties.always.map((p: any) => escapeHtml(String(p))).join(", ")}`);
   }
   if (properties.metadata) {
     if (properties.metadata.filepath) {
@@ -169,7 +172,7 @@ export async function handleSessionIdle(ctx: ProjectContext, sessionId: string):
     const lastMessage = await getLastAssistantMessage(client, sessionId);
     const prefix = projectName ? `[${escapeHtml(projectName)}] ` : "";
     if (lastMessage) {
-      const full = `${prefix}<b>${escapeHtml(title)}</b>\n\n${lastMessage}\n\n<em>Reply to continue the session.</em>`;
+      const full = `${prefix}<b>${escapeHtml(title)}</b>\n\n${escapeHtml(lastMessage)}\n\n<em>Reply to continue the session.</em>`;
       await sendOrAttach(api, full, sessionId, `${prefix}${title}`, threadId);
     } else {
       await api.sendText(

@@ -53,9 +53,17 @@ export class TelegramApi {
           headers: { "content-type": "application/json" },
           body: JSON.stringify(params),
         });
-        const body = (await res.json()) as { ok: boolean; result?: T; error_code?: number; description?: string };
-        if (!body.ok) throw new Error(`${method} failed: ${body.error_code} ${body.description}`);
-        return body.result as T;
+const body = (await res.json()) as { ok: boolean; result?: T; error_code?: number; description?: string };
+      if (!body.ok) {
+        const description = String(body.description ?? "");
+        if (description.includes("can't parse entities") && params.parse_mode) {
+          log.warn("HTML parse failed, retrying without parse_mode", { method, description });
+          const { parse_mode: _dropped, ...rest } = params;
+          return await this.call<T>(method, rest, 0);
+        }
+        throw new Error(`${method} failed: ${body.error_code} ${description}`);
+      }
+      return body.result as T;
       } catch (error) {
         lastError = error;
         if (attempt < retries) await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
