@@ -2,10 +2,12 @@ import {
   archiveSession,
   cleanupDeadInstances,
   countMessages,
+  getLatestActivity,
   getTodoCounts,
   getInstanceSessions,
   getSessionBySlug,
   getSessionById,
+  getSessionByThreadId,
   getTopicBySession,
   isPidAlive,
   listArchivedSessions,
@@ -88,6 +90,9 @@ export async function handleCommand(
       return true;
     case "session":
       await cmdSession(api, args, threadId);
+      return true;
+    case "peek":
+      await cmdPeek(api, args, threadId);
       return true;
     case "archive":
       await cmdArchive(api, args, threadId);
@@ -252,6 +257,63 @@ async function cmdSession(api: TelegramApi, args: string, threadId: number | nul
     msg += `\n\n<b>Archived:</b> ${new Date(Number(s.time_archived)).toISOString().replace("T", " ").slice(0, 19)}`;
   }
   await api.sendText(msg, threadId);
+}
+
+async function cmdPeek(api: TelegramApi, args: string, threadId: number | null) {
+  let sessionId: string;
+  let title: string;
+  let project: string;
+  const slug = args.split(/\s+/)[0];
+  if (slug) {
+    const s = getSessionBySlug(slug) ?? getSessionById(slug);
+    if (!s) {
+      await api.sendText(`Session not found: ${escapeHtml(slug)}`, threadId);
+      return;
+    }
+    sessionId = s.id;
+    title = s.title;
+    project = dirToProject(s.directory ?? "");
+  } else {
+    const topic = threadId == null ? null : getSessionByThreadId(threadId);
+    if (!topic) {
+      await api.sendText(
+        "No opencode session is bound to this topic. Use /peek &lt;slug&gt;.",
+        threadId,
+      );
+      return;
+    }
+    sessionId = topic.session_id as string;
+    title = topic.title || "OpenCode Session";
+    const s = getSessionById(sessionId);
+    project = s ? dirToProject(s.directory ?? "") : "";
+  }
+  const activity = getLatestActivity(sessionId);
+  if (!activity) {
+    await api.sendText("No assistant activity found in this session yet.", threadId);
+    return;
+  }
+  let msg = `${project ? `[${escapeHtml(project)}] ` : ""}<b>${escapeHtml(title)}</b>\n`;
+  msg += activity.lastActivityAt
+    ? `⏱ last activity ${timeAgo(activity.lastActivityAt)} ago\n`
+    : "\n";
+  if (activity.thoughts) {
+    msg += `\n💭 <i>${escapeHtml(truncate(activity.thoughts.trim(), 600))}</i>\n`;
+  }
+  if (activity.tool) {
+    const input = truncate(activity.tool.input.replace(/\s+/g, " ").trim(), 200);
+    msg += `\n🔧 <b>Tool:</b> ${escapeHtml(activity.tool.name)} <em>(${escapeHtml(activity.tool.status)})</em>`;
+    if (input) msg += `\n<code>${escapeHtml(input)}</code>`;
+    const output = activity.tool.output.trim();
+    if (output) {
+      const tail = output.length > 500 ? "…" + output.slice(-499) : output;
+      msg += `\n📤 <pre>${escapeHtml(tail)}</pre>`;
+    }
+    msg += "\n";
+  }
+  if (activity.text) {
+    msg += `\n📝 ${escapeHtml(truncate(activity.text.trim(), 600))}`;
+  }
+  await api.sendText(truncate(msg, MAX_LEN), threadId);
 }
 
 async function cmdArchive(api: TelegramApi, args: string, threadId: number | null) {

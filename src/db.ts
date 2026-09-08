@@ -572,6 +572,56 @@ export function countMessages(sessionId: string) {
   return withOpencodeDb((o) => o.get("SELECT COUNT(*) AS cnt FROM message WHERE session_id = ?", sessionId)?.cnt ?? 0, 0);
 }
 
+export interface SessionActivity {
+  thoughts: string | null;
+  tool: { name: string; status: string; input: string; output: string } | null;
+  text: string | null;
+  lastActivityAt: number;
+}
+
+export function getLatestActivity(sessionId: string): SessionActivity | null {
+  return withOpencodeDb((o) => {
+    const msgs = o.all(
+      "SELECT id FROM message WHERE session_id = ? AND json_extract(data,'$.role')='assistant' ORDER BY time_created DESC LIMIT 3",
+      sessionId,
+    );
+    for (const msg of msgs) {
+      const rows = o.all(
+        "SELECT data, time_updated FROM part WHERE message_id = ? ORDER BY time_created, rowid",
+        msg.id,
+      );
+      if (rows.length === 0) continue;
+      let thoughts: string | null = null;
+      let tool: SessionActivity["tool"] = null;
+      let text: string | null = null;
+      let lastActivityAt = 0;
+      for (const row of rows) {
+        let p: any;
+        try {
+          p = JSON.parse(row.data);
+        } catch {
+          continue;
+        }
+        lastActivityAt = Math.max(lastActivityAt, Number(row.time_updated) || 0);
+        if (p.type === "reasoning" && p.text) thoughts = String(p.text);
+        else if (p.type === "tool" && p.tool) {
+          const input = p.state?.input;
+          const output = p.state?.output ?? p.state?.metadata?.output;
+          tool = {
+            name: String(p.tool),
+            status: String(p.state?.status ?? "unknown"),
+            input:
+              typeof input === "string" ? input : input ? JSON.stringify(input, null, 2) : "",
+            output: typeof output === "string" ? output : "",
+          };
+        } else if (p.type === "text" && p.text) text = String(p.text);
+      }
+      if (thoughts || tool || text) return { thoughts, tool, text, lastActivityAt };
+    }
+    return null;
+  }, null);
+}
+
 export function archiveSession(slug: string) {
   return withOpencodeDb((o) => {
     o.run("UPDATE session SET time_archived = ? WHERE slug = ? AND time_archived IS NULL", Date.now(), slug);
