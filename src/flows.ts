@@ -299,10 +299,17 @@ async function sendNextQuestion(ctx: ProjectContext, requestID?: string): Promis
     );
     await api.sendText(msg, threadId);
   } else if (q.options.length > 0) {
+    const optionList = q.options
+      .map((o, i) =>
+        o.description
+          ? `${i + 1}. <b>${escapeHtml(o.label)}</b>\n    ${escapeHtml(o.description)}`
+          : `${i + 1}. <b>${escapeHtml(o.label)}</b>`,
+      )
+      .join("\n");
     const buttons = q.options.map((o) => {
       const token = state.registerButtonToken(pq.requestID, pq.currentIndex, o.label);
       if (!isHost) storeButtonToken(instanceId, token, pq.requestID, pq.currentIndex, o.label);
-      return { id: `${QANS_PREFIX}${token}`, title: o.label };
+      return { id: `${QANS_PREFIX}${token}`, title: truncate(o.label, 64) };
     });
     if (q.custom !== false) {
       const token = state.registerButtonToken(pq.requestID, pq.currentIndex, "");
@@ -310,7 +317,7 @@ async function sendNextQuestion(ctx: ProjectContext, requestID?: string): Promis
       buttons.push({ id: `${QCUSTOM_PREFIX}${token}`, title: "Type your answer..." });
     }
     const body = truncate(
-      `${prefix}<b>${escapeHtml(title)}</b>\n\n${progress}${header}${escapeHtml(q.question)}`,
+      `${prefix}<b>${escapeHtml(title)}</b>\n\n${progress}${header}${escapeHtml(q.question)}\n\n${optionList}`,
       MAX_LEN - 100,
     );
     await api.sendButtons(body, buttons, threadId);
