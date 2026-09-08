@@ -1,72 +1,88 @@
-import { resolve } from "node:path";
 import { readFileSync, existsSync } from "node:fs";
-import { config as loadDotenv } from "dotenv";
+import { resolve } from "node:path";
 import { homedir } from "node:os";
-import { parse as parseJsonc } from "jsonc-parser";
-
-loadDotenv({ path: resolve(process.cwd(), ".env") });
 
 export interface Config {
   botToken: string;
-  recipientChatId: string;
+  chatId: string;
   enabled: boolean;
 }
 
-interface ConfigFile {
-  bot_token?: string;
-  recipient_chat_id?: string;
-  enabled?: boolean;
-}
-
-function loadConfigFile(): ConfigFile {
-  const configPath = resolve(
-    homedir(),
-    ".config",
-    "opencode",
-    "notification-telegram.jsonc",
-  );
-  if (!existsSync(configPath)) return {};
-  try {
-    const raw = readFileSync(configPath, "utf8");
-    const errors: import("jsonc-parser").ParseError[] = [];
-    const parsed = parseJsonc(raw, errors, { allowTrailingComma: true });
-    if (errors.length > 0) {
-      throw new Error(errors.map((e) => `line ${e.offset}: ${JSON.stringify(e)}`).join("; "));
+function stripJsonc(src: string): string {
+  let out = "";
+  let inStr = false;
+  let inLine = false;
+  let inBlock = false;
+  let esc = false;
+  for (let i = 0; i < src.length; i++) {
+    const c = src[i];
+    const n = src[i + 1];
+    if (inLine) {
+      if (c === "\n") {
+        inLine = false;
+        out += c;
+      }
+      continue;
     }
-    return parsed as ConfigFile;
-  } catch (error) {
-    throw new Error(
-      `Failed to parse config file ${configPath}: ${(error as Error).message}`,
-    );
+    if (inBlock) {
+      if (c === "*" && n === "/") {
+        inBlock = false;
+        i++;
+      }
+      continue;
+    }
+    if (inStr) {
+      out += c;
+      if (esc) esc = false;
+      else if (c === "\\") esc = true;
+      else if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') {
+      inStr = true;
+      out += c;
+      continue;
+    }
+    if (c === "/" && n === "/") {
+      inLine = true;
+      i++;
+      continue;
+    }
+    if (c === "/" && n === "*") {
+      inBlock = true;
+      i++;
+      continue;
+    }
+    out += c;
   }
+  return out.replace(/,(\s*[}\]])/g, "$1");
 }
 
 export function loadConfig(): Config {
-  const file = loadConfigFile();
-
-  const botToken = process.env.TELEGRAM_BOT_TOKEN || file.bot_token;
-  const recipientChatId =
-    process.env.TELEGRAM_RECIPIENT_CHAT_ID || file.recipient_chat_id;
-
+  let file: Record<string, unknown> = {};
+  const path = resolve(homedir(), ".config", "opencode", "notification-telegram.jsonc");
+  if (existsSync(path)) {
+    try {
+      file = JSON.parse(stripJsonc(readFileSync(path, "utf8")));
+    } catch (error) {
+      throw new Error(`Failed to parse ${path}: ${(error as Error).message}`);
+    }
+  }
+  const botToken = process.env.TELEGRAM_BOT_TOKEN || (file.bot_token as string | undefined);
+  const chatId =
+    process.env.TELEGRAM_RECIPIENT_CHAT_ID || (file.recipient_chat_id as string | undefined);
   if (!botToken) {
     throw new Error(
-      "Missing required config: TELEGRAM_BOT_TOKEN\n" +
-        'Set it in ~/.config/opencode/notification-telegram.jsonc as "bot_token" or as env var\n' +
-        "Get one at https://t.me/BotFather",
+      'Missing TELEGRAM_BOT_TOKEN. Set it as env var or "bot_token" in ~/.config/opencode/notification-telegram.jsonc',
     );
   }
-
-  if (!recipientChatId) {
+  if (!chatId) {
     throw new Error(
-      "Missing required config: TELEGRAM_RECIPIENT_CHAT_ID\n" +
-        'Set it in ~/.config/opencode/notification-telegram.jsonc as "recipient_chat_id" or as env var',
+      'Missing TELEGRAM_RECIPIENT_CHAT_ID. Set it as env var or "recipient_chat_id" in ~/.config/opencode/notification-telegram.jsonc (the forum supergroup id, e.g. -1001234567890)',
     );
   }
-
   const envEnabled = process.env.TELEGRAM_ENABLED;
-  const enabled = envEnabled !== undefined
-    ? envEnabled === "true" || envEnabled === "1"
-    : file.enabled !== false;
-
-  return { botToken, recipientChatId, enabled };
+  const enabled =
+    envEnabled !== undefined ? envEnabled === "true" || envEnabled === "1" : file.enabled !== false;
+  return { botToken, chatId, enabled };
 }

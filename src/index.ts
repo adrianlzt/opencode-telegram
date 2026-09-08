@@ -1,45 +1,75 @@
-import type { Plugin } from "@opencode-ai/plugin";
-import { loadConfig, type Config } from "./config.js";
-import { TelegramService } from "./telegram-client.js";
-import { SessionState } from "./session-state.js";
+import { readFileSync, unlinkSync, writeFileSync, existsSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { loadConfig } from "./config.js";
 import { log } from "./logger.js";
+import {
+  openDb,
+  closeDb,
+  cleanupExpired,
+  cleanupDeadInstances,
+  upsertInstanceSession,
+  removeInstanceSession,
+  getInstanceSessions,
+  getSessionByThreadId,
+  getTopicBySession,
+  getSharedQuestionBySession,
+  getSharedPermission,
+  deletePendingQuestion,
+  deletePendingPermission,
+  insertQuestionAnswer,
+  insertPermissionResult,
+  insertForwardedText,
+  pollQuestionAnswers,
+  pollPermissionResults,
+  pollForwardedTexts,
+  pollPendingCustom,
+  resolveSharedButtonToken,
+  insertPendingCustom,
+  setTopicClosed,
+  setTopicTitle,
+  isPidAlive,
+} from "./db.js";
+import { TelegramApi, Poller } from "./telegram.js";
+import { SessionState } from "./session-state.js";
+import { handleCommand } from "./commands.js";
+import {
+  handleSessionIdle,
+  handleSessionError,
+  handlePermissionAsked,
+  handleQuestionAsked,
+  handleQuestionAnswer,
+  replyToPermission,
+  APPROVE_PREFIX,
+  ALWAYS_PREFIX,
+  DENY_PREFIX,
+  QANS_PREFIX,
+  QCUSTOM_PREFIX,
+  type ProjectContext,
+} from "./flows.js";
 
-const TELEGRAM_MAX_TEXT_LENGTH = 4096;
-const APPROVE_PREFIX = "approve:";
-const ALWAYS_PREFIX = "always:";
-const DENY_PREFIX = "deny:";
+const LOCK_PATH = join(tmpdir(), "opencode-telegram.lock");
 
-function escapeHtml(text: string): string {
-  return text
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-}
-
-function truncate(text: string, maxLength: number): string {
-  if (text.length <= maxLength) return text;
-  return text.slice(0, maxLength - 3) + "...";
-}
-
-let messageCounter = 0;
-function nextFilename(): string {
-  messageCounter++;
-  return `opencode-${Date.now()}-${messageCounter}.md`;
-}
-
-async function sendOrAttach(
-  telegram: TelegramService,
-  text: string,
-  caption?: string,
-): Promise<void> {
-  if (text.length <= TELEGRAM_MAX_TEXT_LENGTH) {
-    await telegram.sendText(text);
-  } else {
-    const summary = caption
-      ? truncate(`${escapeHtml(caption)}\n\n<em>Message too long, sent as file.</em>`, TELEGRAM_MAX_TEXT_LENGTH)
-      : truncate("<em>Message too long, sent as file.</em>", TELEGRAM_MAX_TEXT_LENGTH);
-    await telegram.sendText(summary);
-    await telegram.sendDocument(nextFilename(), text, caption);
+function tryBecomeHost(instanceId: string): boolean {
+  if (existsSync(LOCK_PATH)) {
+    try {
+      const raw = readFileSync(LOCK_PATH, "utf8").trim();
+      const pid = parseInt(raw.split(":")[0], 10);
+      if (!isNaN(pid) && isPidAlive(pid)) {
+        log.info(`[${instanceId}] Host already running (pid=${pid})`);
+        return false;
+      }
+      log.info(`[${instanceId}] Stale lock (pid=${pid}), taking over`);
+    } catch {}
+    try {
+      unlinkSync(LOCK_PATH);
+    } catch {}
+  }
+  try {
+    writeFileSync(LOCK_PATH, `${process.pid}:${instanceId}`, { flag: "wx" });
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -49,566 +79,432 @@ function toNonEmptyString(value: unknown): string | null {
   return normalized || null;
 }
 
-function getProjectContext(directory: string | undefined): string {
-  if (!directory) return "";
-  const parts = directory.split("/");
-  return parts[parts.length - 1] || directory;
+function getProjectContext(directory: string | undefined): string | null {
+  if (!directory) return null;
+  return directory.split("/").pop() || directory;
 }
 
-function extractPermissionPrompt(properties: Record<string, unknown>): string {
-  const lines: string[] = [];
-
-  const permission = toNonEmptyString(properties.permission);
-  if (permission) {
-    lines.push(`<b>Permission:</b> ${escapeHtml(permission)}`);
-  }
-
-  const patterns = properties.patterns;
-  if (Array.isArray(patterns) && patterns.length > 0) {
-    lines.push(`<b>Match:</b> ${patterns.map(String).join(", ")}`);
-  }
-
-  const always = properties.always;
-  if (Array.isArray(always) && always.length > 0) {
-    lines.push(`<b>Always allow:</b> ${always.map(String).join(", ")}`);
-  }
-
-  const metadata = properties.metadata as Record<string, unknown> | undefined;
-  if (metadata) {
-    const filepath = toNonEmptyString(metadata.filepath);
-    if (filepath) {
-      lines.push(`<b>File:</b> ${escapeHtml(filepath)}`);
-    }
-
-    const diff = toNonEmptyString(metadata.diff);
-    if (diff) {
-      lines.push(`<b>Diff:</b>\n<pre>${escapeHtml(diff)}</pre>`);
-    }
-  }
-
-  const prompt = toNonEmptyString(properties.prompt);
-  if (prompt) {
-    lines.push(escapeHtml(prompt));
-  }
-
-  const message = toNonEmptyString(properties.message);
-  if (message) {
-    lines.push(escapeHtml(message));
-  }
-
-  return lines.length > 0 ? lines.join("\n") : "A permission request needs your approval.";
-}
-
-type PluginInput = Parameters<Plugin>[0];
-
-interface MessagePart {
-  type: string;
-  text?: string;
-}
-
-interface MessageEntry {
-  info?: { role?: string };
-  parts?: MessagePart[];
-}
-
-async function getLastAssistantMessage(
-  client: PluginInput["client"],
-  sessionId: string,
-): Promise<string> {
-  try {
-    const result = await client.session.messages({
-      path: { id: sessionId },
-    });
-
-    const messages: MessageEntry[] = (result as { data?: MessageEntry[] }).data ?? [];
-
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const msg = messages[i];
-      if (msg.info?.role === "assistant" && msg.parts) {
-        const textParts = msg.parts
-          .filter((p) => p.type === "text" && p.text)
-          .map((p) => p.text!);
-        if (textParts.length > 0) {
-          return textParts.join("\n\n");
-        }
-      }
-    }
-  } catch (error) {
-    log.error("Failed to fetch session messages", { error: String(error) });
-  }
-
-  return "";
-}
-
-function formatMessageParts(parts: MessagePart[]): string {
-  return parts
-    .map((p) => {
-      if (p.type === "text" && p.text) return p.text;
-      if (p.type === "tool") {
-        const tool = (p as unknown as Record<string, unknown>);
-        const name = tool.tool as string | undefined;
-        const input = tool.input;
-        const output = tool.output;
-        let s = `<b>Tool: ${escapeHtml(name || "unknown")}</b>\n`;
-        if (input) s += `<b>Input:</b>\n<pre>${typeof input === "string" ? escapeHtml(input) : escapeHtml(JSON.stringify(input, null, 2))}</pre>\n`;
-        if (output) {
-          const outputStr = typeof output === "string" ? output : JSON.stringify(output);
-          s += `<b>Output:</b>\n<pre>${escapeHtml(outputStr.slice(0, 500))}</pre>\n`;
-        }
-        return s;
-      }
-      return null;
-    })
-    .filter(Boolean)
-    .join("\n");
-}
-
-async function getRecentAssistantContext(
-  client: PluginInput["client"],
-  sessionId: string,
-  maxMessages: number = 3,
-): Promise<string> {
-  try {
-    const result = await client.session.messages({
-      path: { id: sessionId },
-    });
-
-    const messages: MessageEntry[] = (result as { data?: MessageEntry[] }).data ?? [];
-    const assistantBlocks: string[] = [];
-
-    for (let i = messages.length - 1; i >= 0 && assistantBlocks.length < maxMessages; i--) {
-      const msg = messages[i];
-      if (msg.info?.role === "assistant" && msg.parts) {
-        log.debug(`Assistant message parts`, {
-          parts: msg.parts.map((p) => {
-            const entry: Record<string, unknown> = { type: p.type };
-            if (p.type === "tool") {
-              entry.keys = Object.keys((p as unknown as Record<string, unknown>));
-            }
-            return entry;
-          }),
-        });
-        const formatted = formatMessageParts(msg.parts);
-        if (formatted.trim()) {
-          assistantBlocks.unshift(formatted);
-        }
-      }
-    }
-
-    return assistantBlocks.join("\n\n---\n\n");
-  } catch (error) {
-    log.error("Failed to fetch assistant context", { error: String(error) });
-  }
-
-  return "";
-}
-
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-async function replyToPermission(
-  client: any,
-  sessionId: string,
-  permissionId: string,
-  response: "once" | "always" | "reject",
-): Promise<boolean> {
-  log.debug(`replyToPermission call`, { sessionId, permissionId, response });
-  const result = await client.postSessionIdPermissionsPermissionId({
-    path: { id: sessionId, permissionID: permissionId },
-    body: { response },
-  });
-  log.debug(`replyToPermission result`, { result: JSON.stringify(result) });
-  return result as boolean;
-}
-
-export const TelegramPlugin: Plugin = async (ctx) => {
+const TelegramPlugin = async (ctx: { client: any; directory: string }) => {
   const { client, directory } = ctx;
   const instanceId = Math.random().toString(36).slice(2, 8);
 
-  let config: Config;
+  let config;
   try {
     config = loadConfig();
   } catch (error) {
     log.error("Configuration error", { error: (error as Error).message });
-    return {
-      event: async () => {},
-    };
+    return { event: async () => {} };
   }
 
-  log.info(`Plugin initialization started [instance=${instanceId}]`);
+  log.info(`Plugin init [instance=${instanceId}]`);
+  try {
+    openDb();
+  } catch (error) {
+    log.warn(`[${instanceId}] State DB unavailable, cross-instance relay disabled`, {
+      error: String(error),
+    });
+  }
 
   const state = new SessionState(config.enabled);
   const projectName = getProjectContext(directory);
+  const api = new TelegramApi(config.botToken, config.chatId);
+  let isHost = tryBecomeHost(instanceId);
+  if (isHost) log.info(`[${instanceId}] Became host (direct polling)`);
 
-  const telegram = new TelegramService(config, {
-    onButtonReply: async (buttonId: string) => {
-      if (buttonId.startsWith(ALWAYS_PREFIX)) {
-        const permissionId = buttonId.slice(ALWAYS_PREFIX.length);
-        const perm = state.consumePendingPermission(permissionId);
-        if (perm) {
-          try {
-            await replyToPermission(client, perm.sessionId, permissionId, "always");
-            log.info(`Permission ${permissionId} always approved`, { sessionId: perm.sessionId });
-            await telegram.sendText("Permission approved (always).");
-          } catch (error) {
-            log.error("Failed to always approve permission", { error: String(error) });
-          }
-        } else {
-          log.warn(`No pending permission found for ID: ${permissionId}`);
-        }
-      } else if (buttonId.startsWith(APPROVE_PREFIX)) {
-        const permissionId = buttonId.slice(APPROVE_PREFIX.length);
-        const perm = state.consumePendingPermission(permissionId);
-        if (perm) {
-          try {
-            await replyToPermission(client, perm.sessionId, permissionId, "once");
-            log.info(`Permission ${permissionId} approved once`, { sessionId: perm.sessionId });
-            await telegram.sendText("Permission approved.");
-          } catch (error) {
-            log.error("Failed to approve permission", { error: String(error) });
-          }
-        } else {
-          log.warn(`No pending permission found for ID: ${permissionId}`);
-        }
-      } else if (buttonId.startsWith(DENY_PREFIX)) {
-        const permissionId = buttonId.slice(DENY_PREFIX.length);
-        const perm = state.consumePendingPermission(permissionId);
-        if (perm) {
-          try {
-            await replyToPermission(client, perm.sessionId, permissionId, "reject");
-            log.info(`Permission ${permissionId} rejected`, { sessionId: perm.sessionId });
-            await telegram.sendText("Permission rejected.");
-          } catch (error) {
-            log.error("Failed to reject permission", { error: String(error) });
-          }
-        }
+  const flow: ProjectContext = { client, api, state, instanceId, projectName, isHost };
+
+  const poller = new Poller(api, {
+    onText: async (text, threadId) => {
+      if (isHost && text.startsWith("/")) {
+        const handled = await handleCommand(api, instanceId, text, threadId, log);
+        if (handled) return;
       }
-    },
-
-    onTextMessage: async (text: string) => {
-      const activeSession = state.getActiveSession();
-      if (activeSession) {
-        try {
-          log.info(`Forwarding message to session ${activeSession}`);
-          await client.session.prompt({
-            path: { id: activeSession },
-            body: {
-              parts: [{ type: "text", text }],
-            },
-          });
-        } catch (error) {
-          log.error("Failed to send message to session", { error: String(error) });
-        }
-      } else {
-        log.info("No active session to forward message to");
+      if (threadId == null) {
+        await api.sendText("This bot operates in forum topics. Open a session topic to chat.");
+        return;
       }
-    },
-
-    onAudioMessage: async (transcription: string | null) => {
-      const activeSession = state.getActiveSession();
-      if (!activeSession) {
-        log.info("No active session to forward audio message to");
+      const topic = getSessionByThreadId(threadId);
+      if (!topic) {
+        await api.sendText("No opencode session is bound to this topic.", threadId);
+        return;
+      }
+      const sessionId = topic.session_id as string;
+      if (topic.closed) {
+        await api.sendText("This session is archived. Use /resume <slug> to reopen it.", threadId);
         return;
       }
 
-      const text = transcription
-        ? `[Voice message transcription]: ${transcription}`
-        : "The user sent a voice message but transcription was not available.";
-
-      try {
-        log.info(`Forwarding audio transcription to session ${activeSession}`);
-        await client.session.prompt({
-          path: { id: activeSession },
-          body: {
-            parts: [{ type: "text", text }],
-          },
+      const localQ = state.getPendingQuestionBySession(sessionId);
+      if (localQ) {
+        await answerPendingQuestion(flow, localQ, text, threadId);
+        return;
+      }
+      const sharedQ = getSharedQuestionBySession(sessionId);
+      if (sharedQ) {
+        deletePendingQuestion(sharedQ.requestID);
+        insertQuestionAnswer(sharedQ.instanceId, sharedQ.requestID, [[text]]);
+        log.info(`[${instanceId}] Relayed text answer to [instance=${sharedQ.instanceId}]`, {
+          requestID: sharedQ.requestID,
+          sessionId,
         });
-      } catch (error) {
-        log.error("Failed to send audio transcription to session", { error: String(error) });
+        return;
+      }
+
+      if (topic.instance_id === instanceId) {
+        await promptSession(client, sessionId, text);
+      } else {
+        log.info(`[${instanceId}] Forwarding text to [instance=${topic.instance_id}]`, { sessionId });
+        insertForwardedText(topic.instance_id, sessionId, text);
+      }
+    },
+    onButton: async (buttonId, threadId) => {
+      if (buttonId.startsWith(QANS_PREFIX)) {
+        const token = buttonId.slice(QANS_PREFIX.length);
+        const local = state.resolveButtonToken(token);
+        if (local) {
+          await handleQuestionAnswer(flow, local.questionIndex, [local.label], local.requestID);
+        } else if (isHost) {
+          const shared = resolveSharedButtonToken(token);
+          if (shared) {
+            insertQuestionAnswer(shared.instanceId, shared.requestID, [[shared.label]]);
+            log.info(`[${instanceId}] Relayed button answer to [instance=${shared.instanceId}]`, {
+              requestID: shared.requestID,
+            });
+          } else {
+            log.warn(`[${instanceId}] Unknown button token: ${token}`);
+          }
+        }
+        return;
+      }
+      if (buttonId.startsWith(QCUSTOM_PREFIX)) {
+        const token = buttonId.slice(QCUSTOM_PREFIX.length);
+        const local = state.resolveButtonToken(token);
+        if (local) {
+          state.setAwaitingCustom(true, local.requestID);
+          await api.sendText("Type your answer:", threadId);
+        } else if (isHost) {
+          const shared = resolveSharedButtonToken(token);
+          if (shared) {
+            insertPendingCustom(shared.instanceId, shared.requestID);
+            log.info(`[${instanceId}] Relayed custom-answer request to [instance=${shared.instanceId}]`, {
+              requestID: shared.requestID,
+            });
+          }
+        }
+        return;
+      }
+
+      let permissionId: string | null = null;
+      let response: string | null = null;
+      if (buttonId.startsWith(APPROVE_PREFIX)) {
+        permissionId = buttonId.slice(APPROVE_PREFIX.length);
+        response = "once";
+      } else if (buttonId.startsWith(ALWAYS_PREFIX)) {
+        permissionId = buttonId.slice(ALWAYS_PREFIX.length);
+        response = "always";
+      } else if (buttonId.startsWith(DENY_PREFIX)) {
+        permissionId = buttonId.slice(DENY_PREFIX.length);
+        response = "reject";
+      }
+      if (!permissionId || !response) return;
+
+      const perm = state.consumePendingPermission(permissionId);
+      if (perm) {
+        try {
+          await replyToPermission(client, perm.sessionId, permissionId, response);
+          log.info(`[${instanceId}] Permission ${permissionId} ${response}`, { sessionId: perm.sessionId });
+          await api.sendText(`Permission ${response === "reject" ? "rejected" : "approved"}.`, threadId);
+        } catch (error) {
+          log.error(`[${instanceId}] Failed to apply permission`, { error: String(error) });
+        }
+      } else if (isHost) {
+        const shared = getSharedPermission(permissionId);
+        if (shared) {
+          deletePendingPermission(permissionId);
+          insertPermissionResult(shared.instanceId, permissionId, response);
+          log.info(`[${instanceId}] Relayed permission ${response} to [instance=${shared.instanceId}]`, {
+            permissionId,
+          });
+        } else {
+          log.warn(`[${instanceId}] No pending permission for ID: ${permissionId}`);
+        }
+      } else {
+        log.warn(`[${instanceId}] No pending permission for ID: ${permissionId}`);
+      }
+    },
+    onVoice: async (threadId) => {
+      if (threadId == null) return;
+      const topic = getSessionByThreadId(threadId);
+      if (!topic || topic.closed) return;
+      const text = "The user sent a voice message but transcription was not available.";
+      if (topic.instance_id === instanceId) {
+        await promptSession(client, topic.session_id as string, text);
+      } else if (isHost) {
+        insertForwardedText(topic.instance_id, topic.session_id as string, text);
       }
     },
   });
 
-  telegram.start();
+  if (isHost) poller.start();
 
-  let isShuttingDown = false;
+  const cleanupInterval = setInterval(() => {
+    cleanupExpired();
+    cleanupDeadInstances();
+  }, 60_000);
+
+  let pollCounter = 0;
+  const relayInterval = setInterval(async () => {
+    pollCounter++;
+    if (pollCounter % 10 === 0 && !isHost) {
+      try {
+        const raw = readFileSync(LOCK_PATH, "utf8").trim();
+        const hostPid = parseInt(raw.split(":")[0], 10);
+        if (!isNaN(hostPid) && !isPidAlive(hostPid)) {
+          log.info(`[${instanceId}] Host pid=${hostPid} is dead, attempting takeover`);
+          if (tryBecomeHost(instanceId)) {
+            isHost = true;
+            flow.isHost = true;
+            log.info(`[${instanceId}] Promoted to host`);
+            poller.start();
+          }
+        }
+      } catch {}
+    }
+    if (isHost) return;
+
+    for (const { requestID, answers } of pollQuestionAnswers(instanceId)) {
+      log.info(`[${instanceId}] Polled question answer`, { requestID, answer: answers[0] });
+      const pq = state.getPendingQuestion(requestID);
+      if (!pq) {
+        log.warn(`[${instanceId}] No local pending question for polled answer`, { requestID });
+        continue;
+      }
+      await handleQuestionAnswer(flow, pq.currentIndex, answers[0], requestID);
+    }
+    for (const { permissionId, response } of pollPermissionResults(instanceId)) {
+      log.info(`[${instanceId}] Polled permission result`, { permissionId, response });
+      const perm = state.consumePendingPermission(permissionId);
+      if (!perm) continue;
+      try {
+        await replyToPermission(client, perm.sessionId, permissionId, response);
+        log.info(`[${instanceId}] Permission ${permissionId} ${response}`, { sessionId: perm.sessionId });
+        const topicRow = getTopicBySession(perm.sessionId);
+        await api.sendText(
+          `Permission ${response === "reject" ? "rejected" : "approved"}.`,
+          topicRow?.thread_id ?? null,
+        );
+      } catch (error) {
+        log.error(`[${instanceId}] Failed to process permission result`, { error: String(error) });
+      }
+    }
+    for (const requestID of pollPendingCustom(instanceId)) {
+      state.setAwaitingCustom(true, requestID);
+      const pq = state.getPendingQuestion(requestID);
+      if (pq) {
+        const topicRow = getTopicBySession(pq.sessionId);
+        await api.sendText("Type your answer:", topicRow?.thread_id ?? null);
+      }
+    }
+    for (const { sessionId, text } of pollForwardedTexts(instanceId)) {
+      log.info(`[${instanceId}] Received forwarded text`, { sessionId });
+      state.setActiveSession(sessionId);
+      await promptSession(client, sessionId, text);
+    }
+  }, 500);
+
+  let shuttingDown = false;
   const shutdown = () => {
-    if (isShuttingDown) return;
-    isShuttingDown = true;
-    telegram.stop();
+    if (shuttingDown) return;
+    shuttingDown = true;
+    clearInterval(cleanupInterval);
+    clearInterval(relayInterval);
+    removeInstanceSession(instanceId);
+    if (isHost) {
+      poller.stop();
+      try {
+        unlinkSync(LOCK_PATH);
+      } catch {}
+    }
+    closeDb();
   };
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
 
   return {
-    "command.execute.before": async (input: { command: string; sessionID: string }, output: { parts?: unknown[] }) => {
+    "command.execute.before": async (input: { command: string }, output: { parts?: unknown[] }) => {
       if (input.command !== "telegram-pause" && input.command !== "telegram-resume") return;
-
       if (input.command === "telegram-pause") {
-        if (state.pause()) {
-          log.info("Telegram notifications paused via /telegram-pause");
-        } else {
-          log.info("/telegram-pause called but already paused");
-        }
+        log.info(state.pause() ? "Notifications paused via /telegram-pause" : "Already paused");
       } else {
-        if (state.resume()) {
-          log.info("Telegram notifications resumed via /telegram-resume");
-        } else {
-          log.info("/telegram-resume called but already active");
-        }
+        log.info(state.resume() ? "Notifications resumed via /telegram-resume" : "Already active");
       }
-
       if (output.parts) output.parts = [];
       throw new Error("Command handled by Telegram plugin");
     },
-
-    "chat.message": async (_input, output) => {
-      return;
-    },
-
-    event: async ({ event }) => {
-      const runtimeEvent = event as unknown as {
-        type: string;
-        properties: Record<string, unknown>;
-      };
-
-      const { type, properties } = runtimeEvent;
-      log.debug(`Event received [instance=${instanceId}]`, { type, sessionID: properties?.sessionID });
-
+    event: async ({ event }: { event: { type: string; properties: Record<string, any> } }) => {
+      const { type, properties } = event;
       switch (type) {
         case "session.updated": {
-          const info = properties?.info as Record<string, unknown> | undefined;
+          const info = properties?.info;
           const title = info ? toNonEmptyString(info.title) : null;
-          const sessionId = toNonEmptyString(
-            info ? (info.id ?? properties?.sessionID) : properties?.sessionID,
-          );
+          const sessionId = toNonEmptyString(info ? info.id ?? properties?.sessionID : properties?.sessionID);
+          if (title && sessionId) state.setSessionTitle(sessionId, title);
+          if (sessionId && info) {
+            upsertInstanceSession(
+              instanceId,
+              sessionId,
+              toNonEmptyString(info.slug),
+              title,
+              projectName,
+              toNonEmptyString(info.directory),
+            );
+          }
           if (title && sessionId) {
-            state.setSessionTitle(sessionId, title);
+            const existing = getTopicBySession(sessionId);
+            if (existing && existing.instance_id === instanceId && existing.title !== title) {
+              setTopicTitle(sessionId, title);
+              const name = title && projectName ? `${projectName} — ${title}` : title;
+              void api.renameTopic(existing.thread_id, name);
+            }
           }
           break;
         }
-
         case "session.idle": {
           if (state.isPaused()) break;
-          const sessionId = toNonEmptyString(properties.sessionID);
-          if (sessionId) {
-            await handleSessionIdle(
-              client,
-              telegram,
-              state,
-              sessionId,
-              projectName,
-            );
-          }
+          const sessionId = toNonEmptyString(properties?.sessionID);
+          if (!sessionId) break;
+          const title = state.getSessionTitle(sessionId);
+          upsertInstanceSession(
+            instanceId,
+            sessionId,
+            title ? title.toLowerCase().replace(/\s+/g, "-") : null,
+            title,
+            projectName,
+            directory,
+          );
+          await handleSessionIdle(flow, sessionId);
           break;
         }
-
         case "session.error": {
           if (state.isPaused()) break;
-          const sessionId = toNonEmptyString(properties.sessionID);
-          const error = properties.error;
+          const sessionId = toNonEmptyString(properties?.sessionID);
+          if (!sessionId) break;
+          const error = properties?.error;
           const errorMessage =
-            typeof error === "string"
-              ? error
-              : error
-                ? String(error)
-                : "Unknown error";
-
-          if (sessionId) {
-            await handleSessionError(
-              telegram,
-              state,
-              sessionId,
-              errorMessage,
-              projectName,
-            );
-          }
+            typeof error === "string" ? error : error ? String(error) : "Unknown error";
+          upsertInstanceSession(
+            instanceId,
+            sessionId,
+            null,
+            state.getSessionTitle(sessionId),
+            projectName,
+            directory,
+          );
+          await handleSessionError(flow, sessionId, errorMessage);
           break;
         }
-
         case "permission.asked": {
           if (state.isPaused()) break;
-          const permissionId = toNonEmptyString(properties.id);
-          const sessionId = toNonEmptyString(properties.sessionID);
-
-          log.debug("permission.asked event", { properties: JSON.stringify(properties) });
-
-          if (permissionId && sessionId) {
-            await handlePermissionAsked(
-              client,
-              telegram,
-              state,
-              sessionId,
-              permissionId,
-              properties,
-              projectName,
-            );
-          }
+          const permissionId = toNonEmptyString(properties?.id);
+          const sessionId = toNonEmptyString(properties?.sessionID);
+          if (!permissionId || !sessionId) break;
+          upsertInstanceSession(
+            instanceId,
+            sessionId,
+            null,
+            state.getSessionTitle(sessionId),
+            projectName,
+            directory,
+          );
+          await handlePermissionAsked(flow, sessionId, permissionId, properties);
           break;
         }
-
         case "question.asked": {
           if (state.isPaused()) break;
-          const sessionId = toNonEmptyString(properties.sessionID);
-          const questions = properties.questions;
-
-          if (sessionId && Array.isArray(questions) && questions.length > 0) {
-            await handleQuestionAsked(
-              telegram,
-              state,
-              sessionId,
-              questions as Array<{ question?: string; header?: string }>,
-              projectName,
-            );
-          }
+          const sessionId = toNonEmptyString(properties?.sessionID);
+          const requestID = toNonEmptyString(properties?.id);
+          const questions = properties?.questions;
+          if (!sessionId || !requestID || !Array.isArray(questions) || questions.length === 0) break;
+          upsertInstanceSession(
+            instanceId,
+            sessionId,
+            null,
+            state.getSessionTitle(sessionId),
+            projectName,
+            directory,
+          );
+          await handleQuestionAsked(flow, sessionId, requestID, questions);
           break;
         }
       }
     },
-
-    config: async (output: Record<string, unknown>) => {
+    config: async (output: Record<string, any>) => {
       if (!output.command) output.command = {};
-      const cmd = output.command as Record<string, Record<string, string>>;
-      cmd["telegram-pause"] = {
+      output.command["telegram-pause"] = {
         template: "Pause Telegram notifications",
         description: "Pause all Telegram notifications",
       };
-      cmd["telegram-resume"] = {
+      output.command["telegram-resume"] = {
         template: "Resume Telegram notifications",
-        description: "Resume Telegram notifications",
+        description: "Resume all Telegram notifications",
       };
     },
   };
 };
 
-async function handleSessionIdle(
-  client: PluginInput["client"],
-  telegram: TelegramService,
-  state: SessionState,
+async function promptSession(
+  client: { session: { prompt(args: { path: { id: string }; body: { parts: Array<{ type: string; text: string }> } }): Promise<unknown> } },
   sessionId: string,
-  projectName: string,
+  text: string,
 ): Promise<void> {
   try {
-    const title = state.getSessionTitle(sessionId) || "OpenCode Session";
-    const lastMessage = await getLastAssistantMessage(client, sessionId);
-
-    const projectPrefix = projectName ? `[${escapeHtml(projectName)}] ` : "";
-
-    if (lastMessage) {
-      const fullMessage = `${projectPrefix}<b>${escapeHtml(title)}</b>\n\n${lastMessage}\n\n<em>Reply to continue the session.</em>`;
-      await sendOrAttach(telegram, fullMessage, `${projectPrefix}${title}`);
-    } else {
-      await telegram.sendText(
-        `${projectPrefix}<b>${escapeHtml(title)}</b>\n\nSession completed.\n\n<em>Reply to continue.</em>`,
-      );
-    }
-
-    state.setActiveSession(sessionId);
+    await client.session.prompt({
+      path: { id: sessionId },
+      body: { parts: [{ type: "text", text }] },
+    });
   } catch (error) {
-    log.error("Error handling session.idle", { error: String(error) });
+    log.error("Failed to prompt session", { error: String(error), sessionId });
   }
 }
 
-async function handleSessionError(
-  telegram: TelegramService,
-  state: SessionState,
-  sessionId: string,
-  errorMessage: string,
-  projectName: string,
+async function answerPendingQuestion(
+  flow: ProjectContext,
+  pq: NonNullable<ReturnType<SessionState["getPendingQuestionBySession"]>>,
+  text: string,
+  threadId: number | null,
 ): Promise<void> {
-  try {
-    const title = state.getSessionTitle(sessionId) || "OpenCode Session";
-    const projectPrefix = projectName ? `[${escapeHtml(projectName)}] ` : "";
-
-    const message = truncate(
-      `${projectPrefix}<b>${escapeHtml(title)}</b>\n\n<b>Error:</b>\n${escapeHtml(errorMessage.slice(0, 500))}\n\n<em>Reply to continue the session.</em>`,
-      TELEGRAM_MAX_TEXT_LENGTH,
+  const { api } = flow;
+  const q = pq.questions[pq.currentIndex];
+  if (pq.awaitingCustom) {
+    await handleQuestionAnswer(flow, pq.currentIndex, [text], pq.requestID);
+    return;
+  }
+  if (pq.isMultiSelect) {
+    const indices = text
+      .split(/[\s,]+/)
+      .map((s) => parseInt(s, 10) - 1)
+      .filter((n) => !isNaN(n) && n >= 0 && n < q.options.length);
+    if (indices.length === 0) {
+      await api.sendText('Invalid selection. Please enter numbers separated by commas, e.g. "1, 3".', threadId);
+      return;
+    }
+    await handleQuestionAnswer(
+      flow,
+      pq.currentIndex,
+      indices.map((i) => q.options[i].label),
+      pq.requestID,
     );
-
-    await telegram.sendText(message);
-    state.setActiveSession(sessionId);
-  } catch (error) {
-    log.error("Error handling session.error", { error: String(error) });
+    return;
+  }
+  const matched = q.options.find((o) => o.label.toLowerCase() === text.trim().toLowerCase());
+  if (matched) {
+    await handleQuestionAnswer(flow, pq.currentIndex, [matched.label], pq.requestID);
+  } else if (q.custom !== false) {
+    await handleQuestionAnswer(flow, pq.currentIndex, [text], pq.requestID);
+  } else {
+    await api.sendText("Please select one of the options using the buttons above.", threadId);
   }
 }
 
-async function handlePermissionAsked(
-  client: PluginInput["client"],
-  telegram: TelegramService,
-  state: SessionState,
-  sessionId: string,
-  permissionId: string,
-  properties: Record<string, unknown>,
-  projectName: string,
-): Promise<void> {
-  try {
-    const title = state.getSessionTitle(sessionId) || "OpenCode Session";
-    const prompt = extractPermissionPrompt(properties);
-    const projectPrefix = projectName ? `[${escapeHtml(projectName)}] ` : "";
-
-    const context = await getRecentAssistantContext(client, sessionId);
-
-    let body: string;
-    if (context) {
-      body = `${projectPrefix}<b>${escapeHtml(title)}</b>\n\n${context}\n\n<b>Permission request:</b>\n${prompt}`;
-    } else {
-      body = `${projectPrefix}<b>${escapeHtml(title)}</b>\n\n${prompt}`;
-    }
-
-    if (body.length <= TELEGRAM_MAX_TEXT_LENGTH - 100) {
-      await telegram.sendButtons(body, [
-        { id: `${APPROVE_PREFIX}${permissionId}`, title: "Allow once" },
-        { id: `${ALWAYS_PREFIX}${permissionId}`, title: "Allow always" },
-        { id: `${DENY_PREFIX}${permissionId}`, title: "Reject" },
-      ]);
-    } else {
-      const buttonBody = truncate(
-        `${projectPrefix}<b>${escapeHtml(title)}</b>\n\n<b>Permission request:</b>\n${prompt}\n\n<em>Full context sent as file.</em>`,
-        TELEGRAM_MAX_TEXT_LENGTH - 100,
-      );
-      await telegram.sendButtons(buttonBody, [
-        { id: `${APPROVE_PREFIX}${permissionId}`, title: "Allow once" },
-        { id: `${ALWAYS_PREFIX}${permissionId}`, title: "Allow always" },
-        { id: `${DENY_PREFIX}${permissionId}`, title: "Reject" },
-      ]);
-      await telegram.sendDocument(nextFilename(), body, `${projectPrefix}${title} - Permission context`);
-    }
-
-    state.addPendingPermission(permissionId, sessionId);
-  } catch (error) {
-    log.error("Error handling permission.asked", { error: String(error) });
-  }
-}
-
-async function handleQuestionAsked(
-  telegram: TelegramService,
-  state: SessionState,
-  sessionId: string,
-  questions: Array<{ question?: string; header?: string }>,
-  projectName: string,
-): Promise<void> {
-  try {
-    const title = state.getSessionTitle(sessionId) || "OpenCode Session";
-    const projectPrefix = projectName ? `[${escapeHtml(projectName)}] ` : "";
-
-    const questionText = questions
-      .map((q, i) => {
-        const header = q.header ? `${escapeHtml(q.header)}: ` : "";
-        return `${i + 1}. ${header}${escapeHtml(q.question || "(empty question)")}`;
-      })
-      .join("\n");
-
-    const message = truncate(
-      `${projectPrefix}<b>${escapeHtml(title)}</b>\n\n<b>Questions:</b>\n${questionText}\n\n<em>Reply to answer.</em>`,
-      TELEGRAM_MAX_TEXT_LENGTH,
-    );
-
-    await telegram.sendText(message);
-    state.setActiveSession(sessionId);
-  } catch (error) {
-    log.error("Error handling question.asked", { error: String(error) });
-  }
-}
-
-export default {
-  id: "telegram",
-  server: TelegramPlugin,
-}
+const index_default = { id: "telegram", server: TelegramPlugin };
+export { TelegramPlugin, index_default as default };

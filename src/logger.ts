@@ -1,62 +1,46 @@
 import { appendFileSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { homedir } from "node:os";
-
-type LogLevel = "debug" | "info" | "warn" | "error";
 
 const LOG_DIR = join(homedir(), ".local", "share", "opencode-telegram");
 const LOG_FILE = join(LOG_DIR, "plugin.log");
 const MAX_SIZE = 3 * 1024 * 1024;
 const KEEP_SIZE = 1024 * 1024;
 
-function ensureDir(): void {
+function ensureDir() {
   try {
     mkdirSync(LOG_DIR, { recursive: true });
-  } catch {
-    // already exists
-  }
+  } catch {}
 }
 
-function trimIfNeeded(): void {
+function trimIfNeeded() {
   try {
-    const stats = statSync(LOG_FILE);
-    if (stats.size > MAX_SIZE) {
-      const content = readFileSync(LOG_FILE, "utf8");
-      const trimmed = content.slice(-KEEP_SIZE);
-      const firstNewline = trimmed.indexOf("\n");
-      writeFileSync(
-        LOG_FILE,
-        firstNewline >= 0 ? trimmed.slice(firstNewline + 1) : trimmed,
-      );
+    if (statSync(LOG_FILE).size > MAX_SIZE) {
+      const tail = readFileSync(LOG_FILE, "utf8").slice(-KEEP_SIZE);
+      const nl = tail.indexOf("\n");
+      writeFileSync(LOG_FILE, nl >= 0 ? tail.slice(nl + 1) : tail);
     }
-  } catch {
-    // file may not exist yet
-  }
+  } catch {}
 }
 
-function write(level: LogLevel, message: string, extra?: Record<string, unknown>): void {
+function write(level: string, message: string, extra?: Record<string, unknown>) {
   ensureDir();
   trimIfNeeded();
-
-  const timestamp = new Date().toISOString();
-  let line = `[${timestamp}] [${level.toUpperCase()}] ${message}`;
-  if (extra) {
-    line += " " + JSON.stringify(extra);
-  }
+  let line = `[${new Date().toISOString()}] [${level.toUpperCase()}] ${message}`;
+  if (extra) line += " " + JSON.stringify(extra);
   appendFileSync(LOG_FILE, line + "\n");
 }
 
-export const log = {
-  debug(message: string, extra?: Record<string, unknown>): void {
-    write("debug", message, extra);
-  },
-  info(message: string, extra?: Record<string, unknown>): void {
-    write("info", message, extra);
-  },
-  warn(message: string, extra?: Record<string, unknown>): void {
-    write("warn", message, extra);
-  },
-  error(message: string, extra?: Record<string, unknown>): void {
-    write("error", message, extra);
-  },
+export interface Logger {
+  debug(message: string, extra?: Record<string, unknown>): void;
+  info(message: string, extra?: Record<string, unknown>): void;
+  warn(message: string, extra?: Record<string, unknown>): void;
+  error(message: string, extra?: Record<string, unknown>): void;
+}
+
+export const log: Logger = {
+  debug: (message, extra) => write("debug", message, extra),
+  info: (message, extra) => write("info", message, extra),
+  warn: (message, extra) => write("warn", message, extra),
+  error: (message, extra) => write("error", message, extra),
 };

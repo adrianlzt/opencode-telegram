@@ -7,6 +7,9 @@ export default defineConfig({
   dts: true,
   clean: true,
   bundle: true,
-  noExternal: ["telegraf", "dotenv", "jsonc-parser"],
+  minify: false,
+  splitting: false,
   sourcemap: true,
+  target: "node18",
+  external: [],
 });

@@ -1,7 +1,7 @@
 {
   "name": "@adrianlzt/opencode-telegram",
-  "version": "0.1.0",
-  "description": "OpenCode plugin to interact via Telegram",
+  "version": "0.2.0",
+  "description": "OpenCode plugin: chat with sessions via Telegram forum topics (one topic per session)",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -13,19 +13,14 @@
   },
   "scripts": {
     "build": "tsup",
+    "install-plugin": "tsup && cp dist/index.js ~/.config/opencode/plugins/telegram.js",
     "dev": "tsup --watch",
     "typecheck": "tsc --noEmit"
   },
-  "dependencies": {
-    "dotenv": "^16.4.7",
-    "jsonc-parser": "^3.3.1",
-    "telegraf": "^4.16.3"
-  },
+  "dependencies": {},
   "devDependencies": {
-    "@opencode-ai/plugin": "0.0.0-beta-202603271537",
     "@types/node": "^25.5.0",
     "tsup": "^8.4.0",
-    "tsx": "^4.21.0",
     "typescript": "^5.7.0"
   }
 }
