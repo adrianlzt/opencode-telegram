@@ -1,5 +1,5 @@
 import type { TelegramApi } from "./telegram.js";
-import { getTopicBySession, upsertSessionTopic } from "./db.js";
+import { getTopicBySession, setTopicInstance, upsertSessionTopic } from "./db.js";
 import { log } from "./logger.js";
 
 export function buildTopicName(title: string | null | undefined, projectName: string | null | undefined): string {
@@ -22,7 +22,15 @@ export async function ensureTopic(
   },
 ): Promise<number | null> {
   const existing = getTopicBySession(opts.sessionId);
-  if (existing) return existing.thread_id;
+  if (existing) {
+    if (existing.instance_id !== opts.instanceId) {
+      setTopicInstance(opts.sessionId, opts.instanceId);
+      log.info(
+        `Rebound topic ${existing.thread_id} for session ${opts.sessionId}: [instance=${existing.instance_id}] -> [instance=${opts.instanceId}]`,
+      );
+    }
+    return existing.thread_id;
+  }
   const name = buildTopicName(opts.title, opts.projectName);
   try {
     const result = await api.createTopic(name);

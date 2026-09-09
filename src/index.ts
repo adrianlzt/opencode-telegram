@@ -28,6 +28,9 @@ import {
   insertPendingCustom,
   setTopicClosed,
   setTopicTitle,
+  setTopicInstance,
+  touchInstanceSession,
+  getSessionById,
   isPidAlive,
 } from "./db.js";
 import { TelegramApi, Poller } from "./telegram.js";
@@ -84,6 +87,24 @@ function getProjectContext(directory: string | undefined): string | null {
   return directory.split("/").pop() || directory;
 }
 
+function isInstanceAlive(targetInstanceId: string): boolean {
+  const rows = getInstanceSessions().filter((i: any) => i.instance_id === targetInstanceId);
+  return rows.length > 0 && isPidAlive(Number(rows[0].pid));
+}
+
+function resolveLiveOwner(sessionId: string): string | null {
+  cleanupDeadInstances();
+  const live = getInstanceSessions().filter((i: any) => isPidAlive(i.pid));
+  const active = live.find((i: any) => i.session_id === sessionId);
+  if (active) return active.instance_id as string;
+  const dir = toNonEmptyString(getSessionById(sessionId)?.directory);
+  if (dir) {
+    const match = live.find((i: any) => i.directory === dir);
+    if (match) return match.instance_id as string;
+  }
+  return null;
+}
+
 const TelegramPlugin = async (ctx: { client: any; directory: string }) => {
   const { client, directory } = ctx;
   const instanceId = Math.random().toString(36).slice(2, 8);
@@ -112,6 +133,8 @@ const TelegramPlugin = async (ctx: { client: any; directory: string }) => {
   if (isHost) log.info(`[${instanceId}] Became host (direct polling)`);
 
   const flow: ProjectContext = { client, api, state, instanceId, projectName, isHost };
+
+  upsertInstanceSession(instanceId, null, null, null, projectName, directory);
 
   const poller = new Poller(api, {
     onText: async (text, threadId) => {
@@ -150,11 +173,25 @@ const TelegramPlugin = async (ctx: { client: any; directory: string }) => {
         return;
       }
 
-      if (topic.instance_id === instanceId) {
+      let targetInstanceId = topic.instance_id as string;
+      if (targetInstanceId !== instanceId && !isInstanceAlive(targetInstanceId)) {
+        const resolved = resolveLiveOwner(sessionId);
+        if (!resolved) {
+          await api.sendText(
+            "No live opencode instance owns this session. Start opencode for that project and try again.",
+            threadId,
+          );
+          return;
+        }
+        setTopicInstance(sessionId, resolved);
+        log.info(`[${instanceId}] Rebound session ${sessionId} to [instance=${resolved}]`);
+        targetInstanceId = resolved;
+      }
+      if (targetInstanceId === instanceId) {
         await promptSession(client, sessionId, text);
       } else {
-        log.info(`[${instanceId}] Forwarding text to [instance=${topic.instance_id}]`, { sessionId });
-        insertForwardedText(topic.instance_id, sessionId, text);
+        log.info(`[${instanceId}] Forwarding text to [instance=${targetInstanceId}]`, { sessionId });
+        insertForwardedText(targetInstanceId, sessionId, text);
       }
     },
     onButton: async (buttonId, threadId) => {
@@ -237,10 +274,21 @@ const TelegramPlugin = async (ctx: { client: any; directory: string }) => {
       const topic = getSessionByThreadId(threadId);
       if (!topic || topic.closed) return;
       const text = "The user sent a voice message but transcription was not available.";
-      if (topic.instance_id === instanceId) {
-        await promptSession(client, topic.session_id as string, text);
-      } else if (isHost) {
-        insertForwardedText(topic.instance_id, topic.session_id as string, text);
+      const sessionId = topic.session_id as string;
+      let targetInstanceId = topic.instance_id as string;
+      if (targetInstanceId !== instanceId && !isInstanceAlive(targetInstanceId)) {
+        const resolved = resolveLiveOwner(sessionId);
+        if (!resolved) {
+          await api.sendText("No live opencode instance owns this session.", threadId);
+          return;
+        }
+        setTopicInstance(sessionId, resolved);
+        targetInstanceId = resolved;
+      }
+      if (targetInstanceId === instanceId) {
+        await promptSession(client, sessionId, text);
+      } else {
+        insertForwardedText(targetInstanceId, sessionId, text);
       }
     },
   });
@@ -255,6 +303,7 @@ const TelegramPlugin = async (ctx: { client: any; directory: string }) => {
   let pollCounter = 0;
   const relayInterval = setInterval(async () => {
     pollCounter++;
+    if (pollCounter % 60 === 0) touchInstanceSession(instanceId);
     if (pollCounter % 10 === 0 && !isHost) {
       try {
         const raw = readFileSync(LOCK_PATH, "utf8").trim();
@@ -358,6 +407,8 @@ const TelegramPlugin = async (ctx: { client: any; directory: string }) => {
               projectName,
               toNonEmptyString(info.directory),
             );
+            const existing = getTopicBySession(sessionId);
+            if (existing && existing.instance_id !== instanceId) setTopicInstance(sessionId, instanceId);
           }
           if (title && sessionId) {
             const existing = getTopicBySession(sessionId);

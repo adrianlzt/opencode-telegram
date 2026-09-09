@@ -204,6 +204,12 @@ export function setTopicTitle(sessionId: string, title: string): void {
   } catch {}
 }
 
+export function setTopicInstance(sessionId: string, instanceId: string): void {
+  try {
+    d().run("UPDATE session_topics SET instance_id = ? WHERE session_id = ?", instanceId, sessionId);
+  } catch {}
+}
+
 // --- cross-instance relay ---
 
 export function insertPendingQuestion(
@@ -442,6 +448,12 @@ export function upsertInstanceSession(
 export function removeInstanceSession(instanceId: string): void {
   try {
     d().run("DELETE FROM instance_sessions WHERE instance_id = ?", instanceId);
+  } catch {}
+}
+
+export function touchInstanceSession(instanceId: string): void {
+  try {
+    d().run("UPDATE instance_sessions SET time_updated = datetime('now') WHERE instance_id = ?", instanceId);
   } catch {}
 }
 
