@@ -94,6 +94,13 @@ export function openDb(): void {
       text TEXT NOT NULL,
       created_at TEXT DEFAULT (datetime('now'))
     );
+    CREATE TABLE IF NOT EXISTS relay_actions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      target_instance_id TEXT NOT NULL,
+      action TEXT NOT NULL,
+      payload_json TEXT NOT NULL,
+      created_at TEXT DEFAULT (datetime('now'))
+    );
     CREATE TABLE IF NOT EXISTS instance_sessions (
       instance_id TEXT PRIMARY KEY,
       pid INTEGER NOT NULL,
@@ -133,6 +140,7 @@ export function cleanupExpired(): void {
     db.exec("DELETE FROM button_tokens WHERE created_at < datetime('now', '-10 minutes')");
     db.exec("DELETE FROM pending_custom WHERE created_at < datetime('now', '-10 minutes')");
     db.exec("DELETE FROM forwarded_texts WHERE created_at < datetime('now', '-10 minutes')");
+    db.exec("DELETE FROM relay_actions WHERE created_at < datetime('now', '-10 minutes')");
     db.exec("DELETE FROM instance_sessions WHERE time_updated < datetime('now', '-10 minutes')");
   } catch {}
 }
@@ -420,6 +428,38 @@ export function pollForwardedTexts(instanceId: string) {
   }
 }
 
+export function insertRelayAction(targetInstanceId: string, action: string, payload: Record<string, unknown>): void {
+  try {
+    d().run(
+      "INSERT INTO relay_actions (target_instance_id, action, payload_json) VALUES (?, ?, ?)",
+      targetInstanceId,
+      action,
+      JSON.stringify(payload),
+    );
+  } catch (error) {
+    log.error("Failed to insert relay action", { error: String(error), action });
+  }
+}
+
+export function pollRelayActions(instanceId: string): Array<{ id: number; action: string; payload: unknown }> {
+  try {
+    const rows = d().all(
+      "SELECT id, action, payload_json FROM relay_actions WHERE target_instance_id = ? ORDER BY id",
+      instanceId,
+    );
+    const out: Array<{ id: number; action: string; payload: unknown }> = [];
+    for (const row of rows) {
+      d().run("DELETE FROM relay_actions WHERE id = ?", row.id);
+      try {
+        out.push({ id: row.id as number, action: row.action as string, payload: JSON.parse(row.payload_json as string) });
+      } catch {}
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
 // --- instance tracking ---
 
 export function upsertInstanceSession(
@@ -474,6 +514,24 @@ export function isPidAlive(pid: number): boolean {
   } catch {
     return false;
   }
+}
+
+export function isInstanceAlive(targetInstanceId: string): boolean {
+  const rows = getInstanceSessions().filter((i: any) => i.instance_id === targetInstanceId);
+  return rows.length > 0 && isPidAlive(Number(rows[0].pid));
+}
+
+export function resolveLiveOwner(sessionId: string): string | null {
+  cleanupDeadInstances();
+  const live = getInstanceSessions().filter((i: any) => isPidAlive(i.pid));
+  const active = live.find((i: any) => i.session_id === sessionId);
+  if (active) return active.instance_id as string;
+  const directory = getSessionById(sessionId)?.directory;
+  if (typeof directory === "string" && directory) {
+    const match = live.find((i: any) => i.directory === directory);
+    if (match) return match.instance_id as string;
+  }
+  return null;
 }
 
 export function cleanupDeadInstances(): void {

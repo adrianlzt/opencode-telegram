@@ -32,10 +32,15 @@ import {
   touchInstanceSession,
   getSessionById,
   isPidAlive,
+  isInstanceAlive,
+  resolveLiveOwner,
+  pollRelayActions,
 } from "./db.js";
 import { TelegramApi, Poller } from "./telegram.js";
 import { SessionState } from "./session-state.js";
 import { handleCommand } from "./commands.js";
+import { MENU_PREFIX, handleMenuButton, applySwitchModelAction } from "./menus.js";
+import { applyForkAction, applyUndoAction, applyCompactAction } from "./ops.js";
 import {
   handleSessionIdle,
   handleSessionError,
@@ -87,24 +92,6 @@ function getProjectContext(directory: string | undefined): string | null {
   return directory.split("/").pop() || directory;
 }
 
-function isInstanceAlive(targetInstanceId: string): boolean {
-  const rows = getInstanceSessions().filter((i: any) => i.instance_id === targetInstanceId);
-  return rows.length > 0 && isPidAlive(Number(rows[0].pid));
-}
-
-function resolveLiveOwner(sessionId: string): string | null {
-  cleanupDeadInstances();
-  const live = getInstanceSessions().filter((i: any) => isPidAlive(i.pid));
-  const active = live.find((i: any) => i.session_id === sessionId);
-  if (active) return active.instance_id as string;
-  const dir = toNonEmptyString(getSessionById(sessionId)?.directory);
-  if (dir) {
-    const match = live.find((i: any) => i.directory === dir);
-    if (match) return match.instance_id as string;
-  }
-  return null;
-}
-
 const TelegramPlugin = async (ctx: { client: any; directory: string }) => {
   const { client, directory } = ctx;
   const instanceId = Math.random().toString(36).slice(2, 8);
@@ -139,7 +126,7 @@ const TelegramPlugin = async (ctx: { client: any; directory: string }) => {
   const poller = new Poller(api, {
     onText: async (text, threadId) => {
       if (isHost && text.startsWith("/")) {
-        const handled = await handleCommand(api, instanceId, text, threadId, log);
+        const handled = await handleCommand(api, instanceId, text, threadId, log, client, projectName);
         if (handled) return;
       }
       if (threadId == null) {
@@ -195,6 +182,10 @@ const TelegramPlugin = async (ctx: { client: any; directory: string }) => {
       }
     },
     onButton: async (buttonId, threadId) => {
+      if (buttonId.startsWith(MENU_PREFIX)) {
+        if (isHost) await handleMenuButton(client, api, instanceId, buttonId, threadId, log);
+        return;
+      }
       if (buttonId.startsWith(QANS_PREFIX)) {
         const token = buttonId.slice(QANS_PREFIX.length);
         const local = state.resolveButtonToken(token);
@@ -358,6 +349,23 @@ const TelegramPlugin = async (ctx: { client: any; directory: string }) => {
       log.info(`[${instanceId}] Received forwarded text`, { sessionId });
       state.setActiveSession(sessionId);
       await promptSession(client, sessionId, text);
+    }
+    for (const { action, payload } of pollRelayActions(instanceId)) {
+      if (action === "switch_model") {
+        log.info(`[${instanceId}] Polled relay action`, { action });
+        await applySwitchModelAction(client, api, payload, log);
+      } else if (action === "fork") {
+        log.info(`[${instanceId}] Polled relay action`, { action });
+        await applyForkAction(client, api, instanceId, projectName, payload, log);
+      } else if (action === "undo") {
+        log.info(`[${instanceId}] Polled relay action`, { action });
+        await applyUndoAction(client, api, payload, log);
+      } else if (action === "compact") {
+        log.info(`[${instanceId}] Polled relay action`, { action });
+        await applyCompactAction(client, api, payload, log);
+      } else {
+        log.warn(`[${instanceId}] Unknown relay action`, { action });
+      }
     }
   }, 500);
 

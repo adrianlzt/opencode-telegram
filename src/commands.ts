@@ -9,15 +9,22 @@ import {
   getSessionById,
   getSessionByThreadId,
   getTopicBySession,
+  insertRelayAction,
+  isInstanceAlive,
   isPidAlive,
   listArchivedSessions,
   listSessions,
   listTodos,
+  resolveLiveOwner,
   resumeSession,
   setTopicClosed,
+  setTopicInstance,
 } from "./db.js";
+import { ensureTopic } from "./topics.js";
 import type { Logger } from "./logger.js";
 import type { TelegramApi } from "./telegram.js";
+import { cmdModel, type ModelClient } from "./menus.js";
+import { applyCompactAction, applyForkAction, applyUndoAction } from "./ops.js";
 
 const MAX_LEN = 4096;
 
@@ -65,12 +72,75 @@ function todoLine(t: any): string {
   return `${icon} ${escapeHtml(t.content)} [${escapeHtml(t.priority)}]`;
 }
 
+export interface SessionLike {
+  id: string;
+  title?: string | null;
+}
+
+export interface CmdClient {
+  session: {
+    get(args: { path: { id: string } }): Promise<{
+      data?: { title?: string | null; model?: { providerID?: string; id?: string } | null } | null;
+    }>;
+    messages(args: { path: { id: string } }): Promise<{ data?: any[] }>;
+    create(args: { body?: Record<string, unknown> }): Promise<{ data?: SessionLike }>;
+    fork(args: { path: { id: string }; body?: { messageID?: string } }): Promise<{ data?: SessionLike }>;
+    revert(args: { path: { id: string }; body: { messageID: string } }): Promise<{ data?: SessionLike }>;
+  };
+  provider: {
+    list(): Promise<{
+      data?: {
+        all?: Array<{ id: string; name?: string; models?: Record<string, unknown> }>;
+        default?: Record<string, string>;
+        connected?: string[];
+      } | null;
+    }>;
+  };
+  app: {
+    agents(): Promise<{
+      data?: Array<{ id?: string; name?: string; mode?: string; description?: string; hidden?: boolean }> | null;
+    }>;
+  };
+  mcp: {
+    status(): Promise<{ data?: Record<string, { status?: string; error?: string }> | null }>;
+  };
+  _client: {
+    post(args: { url: string; body: unknown; headers: Record<string, string> }): Promise<unknown>;
+    get(args: { url: string }): Promise<unknown>;
+  };
+}
+
+function resolveOwner(topic: any, instanceId: string): string | null {
+  const owner = topic.instance_id as string;
+  if (owner === instanceId) return owner;
+  if (isInstanceAlive(owner)) return owner;
+  const resolved = resolveLiveOwner(topic.session_id as string);
+  if (!resolved) return null;
+  setTopicInstance(topic.session_id as string, resolved);
+  return resolved;
+}
+
+function requireSessionTopic(api: TelegramApi, threadId: number | null, hint: string): any | null {
+  if (threadId == null) {
+    void api.sendText(hint, null);
+    return null;
+  }
+  const topic = getSessionByThreadId(threadId);
+  if (!topic) {
+    void api.sendText("No opencode session is bound to this topic.", threadId);
+    return null;
+  }
+  return topic;
+}
+
 export async function handleCommand(
   api: TelegramApi,
   instanceId: string,
   command: string,
   threadId: number | null,
   log: Logger,
+  client: CmdClient,
+  projectName: string | null = null,
 ): Promise<boolean> {
   const trimmed = command.trim();
   if (!trimmed.startsWith("/")) return false;
@@ -79,6 +149,9 @@ export async function handleCommand(
   const args = spaceIdx > 0 ? trimmed.slice(spaceIdx + 1).trim() : "";
   log.info("Command received", { cmd, args, threadId });
   switch (cmd) {
+    case "help":
+      await cmdHelp(api, threadId);
+      return true;
     case "status":
       await cmdStatus(api, instanceId, threadId);
       return true;
@@ -100,9 +173,67 @@ export async function handleCommand(
     case "resume":
       await cmdResume(api, args, threadId);
       return true;
+    case "model":
+    case "models":
+      await cmdModel(client, api, instanceId, args, threadId, log);
+      return true;
+    case "new":
+      await cmdNew(client, api, instanceId, projectName, threadId, log);
+      return true;
+    case "fork":
+      await cmdFork(client, api, instanceId, projectName, threadId, log);
+      return true;
+    case "compact":
+      await cmdCompact(client, api, instanceId, threadId, log);
+      return true;
+    case "undo":
+      await cmdUndo(client, api, instanceId, threadId, log);
+      return true;
+    case "agents":
+      await cmdAgents(client, api, threadId, log);
+      return true;
+    case "mcps":
+      await cmdMcps(client, api, threadId, log);
+      return true;
+    case "skills":
+      await cmdSkills(client, api, threadId, log);
+      return true;
     default:
       return false;
   }
+}
+
+const HELP_LINES: Array<[string, string]> = [
+  ["/help", "show this command list"],
+  ["/status", "connected instances, todo and session counts"],
+  ["/todos [filter] [--all]", "pending todos (all sessions)"],
+  ["/sessions [--project p] [--limit n]", "recent sessions"],
+  ["/session <slug>", "session details"],
+  ["/peek [slug]", "live status: thoughts, running tool, output"],
+  ["/model [provider/model]", "list or switch the session model"],
+  ["/new", "start a new session for this project"],
+  ["/fork", "fork the current session"],
+  ["/undo", "revert the last exchange"],
+  ["/compact", "compact the session context"],
+  ["/agents", "list available agents"],
+  ["/mcps", "list MCP servers and their status"],
+  ["/skills", "list available skills"],
+  ["/archive <slug> | --list", "archive a session (closes its topic)"],
+  ["/resume <slug>", "reopen an archived session"],
+];
+
+async function cmdHelp(api: TelegramApi, threadId: number | null) {
+  let msg = "<b>Commands</b>\n";
+  for (const [cmd, desc] of HELP_LINES) {
+    const line = `\n${escapeHtml(cmd)} — ${escapeHtml(desc)}`;
+    if (msg.length + line.length >= MAX_LEN - 100) {
+      msg += "\n<em>...</em>";
+      break;
+    }
+    msg += line;
+  }
+  msg += "\n\n<em>Any other message is sent to the session as a prompt. Unarchived topics map 1:1 to opencode sessions.</em>";
+  await api.sendText(msg, threadId);
 }
 
 async function cmdStatus(api: TelegramApi, instanceId: string, threadId: number | null) {
@@ -391,5 +522,240 @@ async function cmdResume(api: TelegramApi, args: string, threadId: number | null
     );
   } else {
     await api.sendText(`Failed to resume: ${escapeHtml(slug)}`, threadId);
+  }
+}
+
+async function cmdNew(
+  client: CmdClient,
+  api: TelegramApi,
+  instanceId: string,
+  projectName: string | null,
+  threadId: number | null,
+  log: Logger,
+): Promise<void> {
+  try {
+    const res = await client.session.create({ body: {} });
+    const s = res.data;
+    if (!s?.id) throw new Error("session create returned no session");
+    const thread = await ensureTopic(api, {
+      sessionId: s.id,
+      title: s.title ?? null,
+      projectName,
+      instanceId,
+    });
+    log.info("Session created", { sessionId: s.id, threadId: thread });
+    await api.sendText(
+      `✅ New session: <b>${escapeHtml(s.title ?? "untitled")}</b> <code>${escapeHtml(s.id)}</code>${
+        thread ? "\nChat with it in this new topic." : ""
+      }`,
+      thread ?? threadId,
+    );
+  } catch (error) {
+    log.error("Failed to create session", { error: String(error), threadId });
+    await api.sendText(`❌ Failed to create session: ${escapeHtml(String(error))}`, threadId);
+  }
+}
+
+async function cmdFork(
+  client: CmdClient,
+  api: TelegramApi,
+  instanceId: string,
+  projectName: string | null,
+  threadId: number | null,
+  log: Logger,
+): Promise<void> {
+  const topic = requireSessionTopic(
+    api,
+    threadId,
+    "This bot operates in forum topics. Send /fork inside a session topic.",
+  );
+  if (!topic) return;
+  const sessionId = topic.session_id as string;
+  const owner = resolveOwner(topic, instanceId);
+  if (!owner) {
+    await api.sendText("No live opencode instance owns this session.", threadId);
+    return;
+  }
+  if (owner !== instanceId) {
+    insertRelayAction(owner, "fork", { sessionId, threadId });
+    await api.sendText("⏳ Fork relayed to the owning instance.", threadId);
+    return;
+  }
+  try {
+    const res = await client.session.fork({ path: { id: sessionId }, body: {} });
+    const s = res.data;
+    if (!s?.id) throw new Error("fork returned no session");
+    const thread = await ensureTopic(api, {
+      sessionId: s.id,
+      title: s.title ?? null,
+      projectName,
+      instanceId,
+    });
+    log.info("Session forked", { sessionId, forkedTo: s.id, threadId: thread });
+    await api.sendText(
+      `✅ Forked to new session: <b>${escapeHtml(s.title ?? "forked session")}</b> <code>${escapeHtml(s.id)}</code>${
+        thread ? "\nChat with it in this new topic." : ""
+      }`,
+      thread ?? threadId,
+    );
+  } catch (error) {
+    log.error("Failed to fork session", { error: String(error), sessionId });
+    await api.sendText(`❌ Fork failed: ${escapeHtml(String(error))}`, threadId);
+  }
+}
+
+async function cmdCompact(
+  client: CmdClient,
+  api: TelegramApi,
+  instanceId: string,
+  threadId: number | null,
+  log: Logger,
+): Promise<void> {
+  const topic = requireSessionTopic(
+    api,
+    threadId,
+    "This bot operates in forum topics. Send /compact inside a session topic.",
+  );
+  if (!topic) return;
+  const sessionId = topic.session_id as string;
+  const owner = resolveOwner(topic, instanceId);
+  if (!owner) {
+    await api.sendText("No live opencode instance owns this session.", threadId);
+    return;
+  }
+  if (owner !== instanceId) {
+    insertRelayAction(owner, "compact", { sessionId, threadId });
+    await api.sendText("⏳ Compact relayed to the owning instance.", threadId);
+    return;
+  }
+  await applyCompactAction(client, api, { sessionId, threadId }, log);
+}
+
+async function cmdUndo(
+  client: CmdClient,
+  api: TelegramApi,
+  instanceId: string,
+  threadId: number | null,
+  log: Logger,
+): Promise<void> {
+  const topic = requireSessionTopic(
+    api,
+    threadId,
+    "This bot operates in forum topics. Send /undo inside a session topic.",
+  );
+  if (!topic) return;
+  const sessionId = topic.session_id as string;
+  const owner = resolveOwner(topic, instanceId);
+  if (!owner) {
+    await api.sendText("No live opencode instance owns this session.", threadId);
+    return;
+  }
+  if (owner !== instanceId) {
+    insertRelayAction(owner, "undo", { sessionId, threadId });
+    await api.sendText("⏳ Undo relayed to the owning instance.", threadId);
+    return;
+  }
+  await applyUndoAction(client, api, { sessionId, threadId }, log);
+}
+
+async function cmdAgents(
+  client: CmdClient,
+  api: TelegramApi,
+  threadId: number | null,
+  log: Logger,
+): Promise<void> {
+  try {
+    const res = await client.app.agents();
+    const agents = (res.data ?? []).filter((a) => !a.hidden);
+    if (agents.length === 0) {
+      await api.sendText("No agents configured.", threadId);
+      return;
+    }
+    const rank: Record<string, number> = { primary: 0, all: 1, subagent: 2 };
+    agents.sort((a, b) => (rank[a.mode ?? ""] ?? 3) - (rank[b.mode ?? ""] ?? 3) || (a.name ?? a.id ?? "").localeCompare(b.name ?? b.id ?? ""));
+    let msg = "<b>Agents</b>\n";
+    for (const a of agents) {
+      const name = a.name ?? a.id ?? "?";
+      const line = `\n<b>${escapeHtml(name)}</b> <em>(${escapeHtml(a.mode ?? "?")})</em>${a.description ? `\n  ${escapeHtml(truncate(a.description, 120))}` : ""}`;
+      if ((msg + line).length >= MAX_LEN - 100) {
+        msg += "\n\n<em>... and more</em>";
+        break;
+      }
+      msg += line;
+    }
+    await api.sendText(msg, threadId);
+  } catch (error) {
+    log.error("Failed to list agents", { error: String(error), threadId });
+    await api.sendText(`❌ Could not list agents: ${escapeHtml(String(error))}`, threadId);
+  }
+}
+
+async function cmdMcps(
+  client: CmdClient,
+  api: TelegramApi,
+  threadId: number | null,
+  log: Logger,
+): Promise<void> {
+  try {
+    const res = await client.mcp.status();
+    const data = res.data ?? {};
+    const names = Object.keys(data).sort();
+    if (names.length === 0) {
+      await api.sendText("No MCP servers configured.", threadId);
+      return;
+    }
+    const icons: Record<string, string> = {
+      connected: "✅",
+      disabled: "⏸",
+      failed: "❌",
+      needs_auth: "🔑",
+      needs_client_registration: "🔑",
+    };
+    let msg = "<b>MCP Servers</b>\n";
+    for (const name of names) {
+      const st = data[name] ?? {};
+      const status = st.status ?? "unknown";
+      const icon = icons[status] ?? "•";
+      const line = `\n${icon} <b>${escapeHtml(name)}</b> <em>(${escapeHtml(status)})</em>${st.error ? `\n  ${escapeHtml(truncate(st.error, 150))}` : ""}`;
+      if ((msg + line).length >= MAX_LEN - 100) {
+        msg += "\n\n<em>... and more</em>";
+        break;
+      }
+      msg += line;
+    }
+    await api.sendText(msg, threadId);
+  } catch (error) {
+    log.error("Failed to list MCP servers", { error: String(error), threadId });
+    await api.sendText(`❌ Could not list MCP servers: ${escapeHtml(String(error))}`, threadId);
+  }
+}
+
+async function cmdSkills(
+  client: CmdClient,
+  api: TelegramApi,
+  threadId: number | null,
+  log: Logger,
+): Promise<void> {
+  try {
+    const res = await client._client.get({ url: "/api/skill" });
+    const data = (res as { data?: Array<{ name: string; description?: string; location?: string }> } | undefined)?.data;
+    if (!Array.isArray(data) || data.length === 0) {
+      await api.sendText("No skills available.", threadId);
+      return;
+    }
+    const sorted = [...data].sort((a, b) => a.name.localeCompare(b.name));
+    let msg = `<b>Skills</b> · ${sorted.length}\n`;
+    for (const s of sorted) {
+      const line = `\n<b>${escapeHtml(s.name)}</b>${s.description ? `\n  ${escapeHtml(truncate(s.description, 120))}` : ""}`;
+      if ((msg + line).length >= MAX_LEN - 100) {
+        msg += "\n\n<em>... and more</em>";
+        break;
+      }
+      msg += line;
+    }
+    await api.sendText(msg, threadId);
+  } catch (error) {
+    log.error("Failed to list skills", { error: String(error), threadId });
+    await api.sendText(`❌ Could not list skills: ${escapeHtml(String(error))}`, threadId);
   }
 }

@@ -113,6 +113,23 @@ const body = (await res.json()) as { ok: boolean; result?: T; error_code?: numbe
     );
   }
 
+  sendButtonRows(text: string, rows: InlineButton[][], threadId?: number | null) {
+    return this.call(
+      "sendMessage",
+      this.thread(
+        {
+          chat_id: this.chatId,
+          text,
+          parse_mode: "HTML",
+          reply_markup: {
+            inline_keyboard: rows.map((row) => row.map((b) => ({ text: b.title, callback_data: b.id }))),
+          },
+        },
+        threadId,
+      ),
+    );
+  }
+
   createTopic(name: string, iconColor?: number) {
     return this.call<{ message_thread_id: number }>("createForumTopic", {
       chat_id: this.chatId,
