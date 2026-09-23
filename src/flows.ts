@@ -266,9 +266,10 @@ export async function handleQuestionAsked(
   questions: AskQuestion[],
 ): Promise<void> {
   try {
-    const { api, state, instanceId, projectName, isHost } = ctx;
+    const { client, api, state, instanceId, projectName, isHost } = ctx;
     state.setActiveSession(sessionId);
-    state.addPendingQuestion(requestID, sessionId, questions);
+    const context = await getLastAssistantMessage(client, sessionId);
+    state.addPendingQuestion(requestID, sessionId, questions, context || undefined);
     const title = state.getSessionTitle(sessionId) || "OpenCode Session";
     await ensureTopic(api, { sessionId, title, projectName, instanceId });
     await sendNextQuestion(ctx, requestID);
@@ -287,6 +288,7 @@ async function sendNextQuestion(ctx: ProjectContext, requestID?: string): Promis
   const q = pq.questions[pq.currentIndex];
   const title = state.getSessionTitle(pq.sessionId) || "OpenCode Session";
   const prefix = projectName ? `[${escapeHtml(projectName)}] ` : "";
+  const contextBlock = pq.context?.trim() ? `${escapeHtml(truncate(pq.context.trim(), 1200))}\n\n` : "";
   const progress =
     pq.questions.length > 1 ? `<em>Question ${pq.currentIndex + 1} of ${pq.questions.length}</em>\n\n` : "";
   const header = q.header ? `<b>${escapeHtml(q.header)}</b>\n` : "";
@@ -297,7 +299,7 @@ async function sendNextQuestion(ctx: ProjectContext, requestID?: string): Promis
       .map((o, i) => `${i + 1}. <b>${escapeHtml(o.label)}</b> — ${escapeHtml(o.description ?? "")}`)
       .join("\n");
     const msg = truncate(
-      `${prefix}<b>${escapeHtml(title)}</b>\n\n${progress}${header}${escapeHtml(q.question)}\n\n${optionList}\n\nReply with numbers separated by commas (e.g. "1, 3")${q.custom !== false ? ", or type a custom answer" : ""}.`,
+      `${prefix}<b>${escapeHtml(title)}</b>\n\n${contextBlock}${progress}${header}${escapeHtml(q.question)}\n\n${optionList}\n\nReply with numbers separated by commas (e.g. "1, 3")${q.custom !== false ? ", or type a custom answer" : ""}.`,
       MAX_LEN,
     );
     await api.sendText(msg, threadId);
@@ -320,13 +322,13 @@ async function sendNextQuestion(ctx: ProjectContext, requestID?: string): Promis
       buttons.push({ id: `${QCUSTOM_PREFIX}${token}`, title: "Type your answer..." });
     }
     const body = truncate(
-      `${prefix}<b>${escapeHtml(title)}</b>\n\n${progress}${header}${escapeHtml(q.question)}\n\n${optionList}`,
+      `${prefix}<b>${escapeHtml(title)}</b>\n\n${contextBlock}${progress}${header}${escapeHtml(q.question)}\n\n${optionList}`,
       MAX_LEN - 100,
     );
     await api.sendButtons(body, buttons, threadId);
   } else {
     const msg = truncate(
-      `${prefix}<b>${escapeHtml(title)}</b>\n\n${progress}${header}${escapeHtml(q.question)}\n\n<em>Reply to answer.</em>`,
+      `${prefix}<b>${escapeHtml(title)}</b>\n\n${contextBlock}${progress}${header}${escapeHtml(q.question)}\n\n<em>Reply to answer.</em>`,
       MAX_LEN,
     );
     await api.sendText(msg, threadId);

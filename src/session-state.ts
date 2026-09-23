@@ -12,6 +12,7 @@ export interface PendingQuestion {
   currentIndex: number;
   awaitingCustom: boolean;
   isMultiSelect: boolean;
+  context?: string;
 }
 
 export class SessionState {
@@ -49,7 +50,12 @@ export class SessionState {
     return null;
   }
 
-  addPendingQuestion(requestID: string, sessionId: string, questions: PendingQuestion["questions"]): void {
+  addPendingQuestion(
+    requestID: string,
+    sessionId: string,
+    questions: PendingQuestion["questions"],
+    context?: string,
+  ): void {
     this.pendingQuestions.set(requestID, {
       requestID,
       sessionId,
@@ -58,6 +64,7 @@ export class SessionState {
       currentIndex: 0,
       awaitingCustom: false,
       isMultiSelect: false,
+      context,
     });
     this.currentQuestionRequestID = requestID;
   }
