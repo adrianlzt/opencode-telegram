@@ -69,7 +69,7 @@ function sessionLine(s: any): string {
 
 function todoLine(t: any): string {
   const icon = t.status === "in_progress" ? "🔄" : "⬜";
-  return `${icon} ${escapeHtml(t.content)} [${escapeHtml(t.priority)}]`;
+  return `${icon} ${escapeHtml(t.content)} [${escapeHtml(t.priority ?? "-")}]`;
 }
 
 export interface SessionLike {

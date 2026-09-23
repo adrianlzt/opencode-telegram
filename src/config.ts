@@ -58,9 +58,17 @@ function stripJsonc(src: string): string {
   return out.replace(/,(\s*[}\]])/g, "$1");
 }
 
+// mimo is an opencode fork: same config layout under ~/.config/mimocode, but we
+// can only tell which app hosts this plugin via its own binary name.
+const isMimo = process.execPath.includes("mimo");
+const CONFIG_DIRS = isMimo ? ["mimocode", "opencode"] : ["opencode", "mimocode"];
+
 export function loadConfig(): Config {
   let file: Record<string, unknown> = {};
-  const path = resolve(homedir(), ".config", "opencode", "notification-telegram.jsonc");
+  const dir = CONFIG_DIRS.find((d) =>
+    existsSync(resolve(homedir(), ".config", d, "notification-telegram.jsonc")),
+  );
+  const path = resolve(homedir(), ".config", dir ?? CONFIG_DIRS[0], "notification-telegram.jsonc");
   if (existsSync(path)) {
     try {
       file = JSON.parse(stripJsonc(readFileSync(path, "utf8")));
@@ -73,12 +81,12 @@ export function loadConfig(): Config {
     process.env.TELEGRAM_RECIPIENT_CHAT_ID || (file.recipient_chat_id as string | undefined);
   if (!botToken) {
     throw new Error(
-      'Missing TELEGRAM_BOT_TOKEN. Set it as env var or "bot_token" in ~/.config/opencode/notification-telegram.jsonc',
+      'Missing TELEGRAM_BOT_TOKEN. Set it as env var or "bot_token" in ~/.config/{mimocode,opencode}/notification-telegram.jsonc',
     );
   }
   if (!chatId) {
     throw new Error(
-      'Missing TELEGRAM_RECIPIENT_CHAT_ID. Set it as env var or "recipient_chat_id" in ~/.config/opencode/notification-telegram.jsonc (the forum supergroup id, e.g. -1001234567890)',
+      'Missing TELEGRAM_RECIPIENT_CHAT_ID. Set it as env var or "recipient_chat_id" in ~/.config/{mimocode,opencode}/notification-telegram.jsonc (the forum supergroup id, e.g. -1001234567890)',
     );
   }
   const envEnabled = process.env.TELEGRAM_ENABLED;

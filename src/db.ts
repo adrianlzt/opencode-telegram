@@ -6,7 +6,38 @@ import { log } from "./logger.js";
 
 const DB_DIR = join(homedir(), ".local", "share", "opencode-telegram");
 const DB_PATH = join(DB_DIR, "state.db");
-const OPENCODE_DB_PATH = join(homedir(), ".local", "share", "opencode", "opencode.db");
+// mimo (opencode fork) ships its own db: mimocode.db with a slightly narrower
+// schema (no session.agent/model, no todo.priority) — see appColumns().
+const isMimo = process.execPath.includes("mimo");
+const OPENCODE_DB_PATH = isMimo
+  ? join(homedir(), ".local", "share", "mimocode", "mimocode.db")
+  : join(homedir(), ".local", "share", "opencode", "opencode.db");
+
+interface AppColumns {
+  agentModel: boolean;
+  todoPriority: boolean;
+}
+
+let appColumnsCache: AppColumns | undefined;
+
+function appColumns(o: Db): AppColumns {
+  if (appColumnsCache) return appColumnsCache;
+  const has = (table: string, col: string) =>
+    (o.all(`PRAGMA table_info(${table})`) as { name: string }[]).some((r) => r.name === col);
+  appColumnsCache = {
+    agentModel: has("session", "agent") && has("session", "model"),
+    todoPriority: has("todo", "priority"),
+  };
+  return appColumnsCache;
+}
+
+function sessionSelect(cols: AppColumns): string {
+  const tail =
+    "summary_additions, summary_deletions, summary_files, time_created, time_updated, time_archived, workspace_id";
+  return cols.agentModel
+    ? `id, slug, title, directory, project_id, agent, model, ${tail}`
+    : `id, slug, title, directory, project_id, ${tail}`;
+}
 
 interface Db {
   exec(sql: string): void;
@@ -542,12 +573,9 @@ export function cleanupDeadInstances(): void {
   } catch {}
 }
 
-// --- reads from opencode.db (commands) ---
+// --- reads from the host app db (commands) ---
 
-const SESSION_COLS =
-  "id, slug, title, directory, project_id, agent, model, summary_additions, summary_deletions, summary_files, time_created, time_updated, time_archived, workspace_id";
-
-function withOpencodeDb<T>(fn: (o: Db) => T, fallback: T): T {
+function withOpencodeDb<T>(fn: (o: Db, cols: AppColumns) => T, fallback: T): T {
   let o: Db;
   try {
     o = openSqlite(OPENCODE_DB_PATH);
@@ -555,9 +583,9 @@ function withOpencodeDb<T>(fn: (o: Db) => T, fallback: T): T {
     return fallback;
   }
   try {
-    return fn(o);
+    return fn(o, appColumns(o));
   } catch (error) {
-    log.error("opencode.db query failed", { error: String(error) });
+    log.error("app db query failed", { path: OPENCODE_DB_PATH, error: String(error) });
     return fallback;
   } finally {
     o.close();
@@ -565,8 +593,8 @@ function withOpencodeDb<T>(fn: (o: Db) => T, fallback: T): T {
 }
 
 export function listSessions(opts: { limit?: number; projectName?: string } = {}) {
-  return withOpencodeDb((o) => {
-    let sql = `SELECT ${SESSION_COLS} FROM session WHERE time_archived IS NULL`;
+  return withOpencodeDb((o, cols) => {
+    let sql = `SELECT ${sessionSelect(cols)} FROM session WHERE time_archived IS NULL`;
     const params: unknown[] = [];
     if (opts.projectName) {
       sql += " AND project_id IN (SELECT id FROM project WHERE name LIKE ? OR worktree LIKE ?)";
@@ -580,23 +608,23 @@ export function listSessions(opts: { limit?: number; projectName?: string } = {}
 
 export function getSessionBySlug(slug: string) {
   return withOpencodeDb(
-    (o) => o.get(`SELECT ${SESSION_COLS} FROM session WHERE slug = ?`, slug) ?? null,
+    (o, cols) => o.get(`SELECT ${sessionSelect(cols)} FROM session WHERE slug = ?`, slug) ?? null,
     null,
   );
 }
 
 export function getSessionById(id: string) {
   return withOpencodeDb(
-    (o) => o.get(`SELECT ${SESSION_COLS} FROM session WHERE id = ?`, id) ?? null,
+    (o, cols) => o.get(`SELECT ${sessionSelect(cols)} FROM session WHERE id = ?`, id) ?? null,
     null,
   );
 }
 
 export function listArchivedSessions(limit = 20) {
   return withOpencodeDb(
-    (o) =>
+    (o, cols) =>
       o.all(
-        `SELECT ${SESSION_COLS} FROM session WHERE time_archived IS NOT NULL ORDER BY time_archived DESC LIMIT ?`,
+        `SELECT ${sessionSelect(cols)} FROM session WHERE time_archived IS NOT NULL ORDER BY time_archived DESC LIMIT ?`,
         limit,
       ),
     [],
@@ -605,10 +633,10 @@ export function listArchivedSessions(limit = 20) {
 
 export function listTodos(opts: { statuses?: string[]; sessionId?: string; filter?: string; limit?: number } = {}) {
   const statuses = opts.statuses ?? ["pending", "in_progress"];
-  return withOpencodeDb((o) => {
+  return withOpencodeDb((o, cols) => {
     const placeholders = statuses.map(() => "?").join(",");
     let sql = `SELECT t.session_id, s.slug AS session_slug, s.title AS session_title,
-      COALESCE(p.name, s.directory) AS project_name, t.content, t.status, t.priority, t.position
+      COALESCE(p.name, s.directory) AS project_name, t.content, t.status, ${cols.todoPriority ? "t.priority" : "NULL AS priority"}, t.position
       FROM todo t JOIN session s ON t.session_id = s.id LEFT JOIN project p ON s.project_id = p.id
       WHERE t.status IN (${placeholders})`;
     const params: unknown[] = [...statuses];

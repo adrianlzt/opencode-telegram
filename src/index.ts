@@ -398,7 +398,10 @@ const TelegramPlugin = async (ctx: { client: any; directory: string }) => {
       if (output.parts) output.parts = [];
       throw new Error("Command handled by Telegram plugin");
     },
-    event: async ({ event }: { event: { type: string; properties: Record<string, any> } }) => {
+    event: async (input: any) => {
+      // opencode passes { event }, mimo (fork) passes { directory, payload }
+      const event = input?.event ?? input?.payload;
+      if (!event) return;
       const { type, properties } = event;
       switch (type) {
         case "session.updated": {
